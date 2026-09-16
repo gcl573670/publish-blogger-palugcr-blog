@@ -525,7 +525,8 @@ function imageDimensions(buf) {
 async function imageQualifies(url) {
   try {
     const res = await fetchWithTimeout(url, { headers: { Range: 'bytes=0-32767' } });
-    if (!res.ok) return true;
+    // Non-2xx = the image is genuinely broken -> never publish it.
+    if (!res.ok) return false;
     const dims = imageDimensions(Buffer.from(await res.arrayBuffer()));
     if (dims) return dims.width >= 640 && dims.height >= 360;
     // Couldn't parse the header — but if the URL itself advertises a small
