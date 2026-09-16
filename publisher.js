@@ -501,7 +501,9 @@ function imageDimensions(buf) {
     return null;
   }
   const magic = buf.toString('ascii', 0, 8);
-  if (magic === '\x89PNG\r\n\x1a\n') {
+  // NOTE: Buffer.toString('ascii') strips the high bit, so byte 0x89 becomes
+  // charcode 9 — compare PNG bytes numerically instead of via a string literal.
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
     return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
   }
   if (buf.toString('ascii', 0, 6) === 'GIF89a' || buf.toString('ascii', 0, 6) === 'GIF87a') {
@@ -519,14 +521,18 @@ function imageDimensions(buf) {
   return null;
 }
 
-// Returns true if image is usable (>=320px wide). Unverifiable images are accepted.
+// Returns true if image is usable (>=640px wide). Unverifiable images are accepted.
 async function imageQualifies(url) {
   try {
     const res = await fetchWithTimeout(url, { headers: { Range: 'bytes=0-32767' } });
     if (!res.ok) return true;
     const dims = imageDimensions(Buffer.from(await res.arrayBuffer()));
-    if (!dims) return true;
-    return dims.width >= 640 && dims.height >= 360;
+    if (dims) return dims.width >= 640 && dims.height >= 360;
+    // Couldn't parse the header — but if the URL itself advertises a small
+    // width, treat it as too small (e.g. BBC /ws/240/, or w=360 queries).
+    const m = (url || '').match(/\/(?:ws\/)?(\d{3})\b|[-_](\d{3})x\b|[?&]w=(\d{3})\b/);
+    if (m && Number(m[1] || m[2] || m[3]) < 640) return false;
+    return true;
   } catch {
     return true;
   }
