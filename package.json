@@ -1,0 +1,12 @@
+{
+  "name": "news-publisher",
+  "version": "1.0.0",
+  "description": "Arabic news publisher (Gulf & Egypt) -> Blogger via API, with OpenRouter AI rewrite",
+  "main": "publisher.js",
+  "scripts": {
+    "start": "node publisher.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
