@@ -2,7 +2,8 @@ name: Publish Arabic News to Blogger
 
 on:
   schedule:
-    - cron: '0 6,12,18 * * *'
+    # One run every 15 minutes -> rotates through all categories in a loop
+    - cron: '*/15 * * * *'
   workflow_dispatch:
 
 concurrency:
@@ -35,3 +36,7 @@ jobs:
           NEWS_DATA_IO_KEY: ${{ secrets.NEWS_DATA_IO_KEY }}
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
           BLOG_STATUS: ${{ secrets.BLOG_STATUS }}
+          MAX_NEWS_AGE_HOURS: ${{ secrets.MAX_NEWS_AGE_HOURS }}
+          GNEWS_TIMEFRAME: ${{ secrets.GNEWS_TIMEFRAME }}
+          SCHEDULE_MODE: ${{ secrets.SCHEDULE_MODE }}
+          GOOGLE_INDEXING_KEY_JSON: ${{ secrets.GOOGLE_INDEXING_KEY_JSON }}

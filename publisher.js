@@ -12,6 +12,7 @@
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const crypto = require('crypto');
 const { URL } = require('url');
 
 // ---------------------------------------------------------------
@@ -55,6 +56,15 @@ const CONFIG = {
   // 'category' appends a short Latin keyword per category so URLs look like:
   // https://blog.palugcr.live/2026/09/sports-news.html   ('none' disables it)
   urlKeywordsMode: (process.env.URL_KEYWORDS_MODE || 'category'),
+  // Freshness: only keep articles newer than this many hours (0 = no limit).
+  maxNewsAgeHours: Number(process.env.MAX_NEWS_AGE_HOURS || 0),
+  // GNews window filter: 1h,4h,12h,24h,48h,7d,30d ('' = disabled, defaults to 30d)
+  gnewsTimeframe: (process.env.GNEWS_TIMEFRAME || '24h'),
+  // 'rotation' (default): every 15-min run publishes 1 post from the next category
+  // in CATEGORY_ROTATION, cycling forever. 'plan' runs the full CATEGORY_PLAN instead.
+  scheduleMode: (process.env.SCHEDULE_MODE || 'rotation'),
+  // Google Indexing API service account JSON (base64-encoded). Leave empty to disable.
+  indexingKeyJson: process.env.GOOGLE_INDEXING_KEY_JSON || '',
 };
 
 const FETCH_TIMEOUT = 30000;
@@ -153,13 +163,26 @@ const CATEGORIES = {
 };
 
 // Daily publishing plan (your 90-day strategy: 5 posts/day).
-// { key, count } -> category + number of posts
+// { key, count } -> category + number of posts (used in SCHEDULE_MODE=plan)
 const CATEGORY_PLAN = [
   { key: 'trending', count: 2 },
   { key: 'arabnews', count: 1 },
   { key: 'sports', count: 1 },
   { key: 'entertainment', count: 1 },
   { key: 'prices', count: 1 },
+];
+
+// Rotating order for SCHEDULE_MODE=rotation (one category per 15-min run).
+// First cycle starts at index 0 after an empty/unknown blog, then advances each run.
+const CATEGORY_ROTATION = [
+  'trending',
+  'arabnews',
+  'sports',
+  'players',
+  'entertainment',
+  'shows',
+  'prices',
+  'market',
 ];
 
 const MAX_FETCH = 12; // fetch up to 12 candidates per category before AI rewrite
@@ -248,7 +271,65 @@ async function publishToBlogger(post) {
   };
   if (post.published) body.published = post.published;
   const created = await bloggerRequest('POST', '/posts', body);
-  return created.id;
+  return { id: created.id, url: created.url || '' };
+}
+
+// ---------------------------------------------------------------
+// GOOGLE INDEXING API (optional — submit new posts to Google fast)
+// Requires: service account JSON with Indexing API enabled + the blog
+// property verified in Search Console (add the SA email as an owner).
+// ---------------------------------------------------------------
+let _indexingToken = null;
+let _indexingExpiresAt = 0;
+
+async function getIndexingToken(sa) {
+  if (_indexingToken && Date.now() < _indexingExpiresAt - 60000) return _indexingToken;
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: 'RS256', typ: 'JWT' };
+  const claims = {
+    iss: sa.client_email,
+    scope: 'https://www.googleapis.com/auth/indexing',
+    aud: sa.token_uri,
+    iat: now,
+    exp: now + 3600,
+  };
+  const b64 = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64url');
+  const signingInput = `${b64(header)}.${b64(claims)}`;
+  const signature = crypto.createSign('RSA-SHA256').update(signingInput).sign(sa.private_key, 'base64url');
+  const res = await fetchWithTimeout(sa.token_uri, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion: `${signingInput}.${signature}`,
+    }).toString(),
+  });
+  const data = await res.json();
+  if (!res.ok || !data.access_token) throw new Error(`Indexing token HTTP ${res.status}: ${JSON.stringify(data).substring(0, 200)}`);
+  _indexingToken = data.access_token;
+  _indexingExpiresAt = Date.now() + (data.expires_in || 3600) * 1000;
+  return _indexingToken;
+}
+
+async function submitToGoogleIndex(postUrl) {
+  if (!CONFIG.indexingKeyJson || CONFIG.publishStatus !== 'LIVE') return;
+  if (!postUrl) {
+    console.log('   ⚠️ Google Indexing skipped: post URL unknown');
+    return;
+  }
+  try {
+    const sa = JSON.parse(Buffer.from(CONFIG.indexingKeyJson, 'base64').toString('utf8'));
+    const token = await getIndexingToken(sa);
+    const res = await fetchWithTimeout('https://indexing.googleapis.com/v3/urlNotifications:publish', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ url: postUrl, type: 'URL_UPDATED' }),
+    });
+    if (!res.ok) throw new Error(`Indexing HTTP ${res.status}: ${(await res.text()).substring(0, 200)}`);
+    console.log(`   🔍 Sent to Google Indexing: ${postUrl}`);
+  } catch (err) {
+    console.log(`   ⚠️ Google Indexing failed: ${err.message}`);
+  }
 }
 
 // ---------------------------------------------------------------
@@ -257,7 +338,7 @@ async function publishToBlogger(post) {
 
 async function fetchGNews(query) {
   if (!CONFIG.gnewsKey) return [];
-  const url = `https://gnews.io/api/v4/search?q=${encodeURIComponent(query)}&lang=ar&max=${MAX_FETCH}&apikey=${CONFIG.gnewsKey}`;
+  const url = `https://gnews.io/api/v4/search?q=${encodeURIComponent(query)}&lang=ar&max=${MAX_FETCH}&sortby=publishedAt${CONFIG.gnewsTimeframe ? `&timeframe=${CONFIG.gnewsTimeframe}` : ''}&apikey=${CONFIG.gnewsKey}`;
   const res = await fetchWithTimeout(url);
   if (!res.ok) throw new Error(`GNews HTTP ${res.status}`);
   const data = await res.json();
@@ -371,6 +452,20 @@ function decodedesc(s) {
   return s.replace(/<!\[CDATA\[|\]\]>/g, '');
 }
 
+function parseArticleDate(d) {
+  if (!d) return NaN;
+  const ms = Date.parse(d);
+  return Number.isNaN(ms) ? NaN : ms;
+}
+
+// Keep only fresh-enough articles; unknown dates are kept but ranked last.
+function isFresh(pubDate, maxHours) {
+  if (!maxHours) return true; // 0 = no limit
+  const ms = parseArticleDate(pubDate);
+  if (Number.isNaN(ms)) return true;
+  return Date.now() - ms <= maxHours * 3600 * 1000;
+}
+
 function decodeXml(s) {
   return (s || '')
     .replace(/<!\[CDATA\[|\]\]>/g, '')
@@ -439,10 +534,14 @@ async function collectArticles(categoryKey) {
     unique.push(a);
   }
 
-  const withImage = unique.filter((a) => a.image_url.startsWith('http'));
-  const withoutImage = unique.filter((a) => !a.image_url.startsWith('http'));
+  // Freshness: drop too-old articles, then sort newest-first (undated ranked last)
+  const fresh = unique.filter((a) => isFresh(a.pubDate, CONFIG.maxNewsAgeHours))
+    .sort((a, b) => (parseArticleDate(b.pubDate) || 0) - (parseArticleDate(a.pubDate) || 0));
 
-  return { withImage, withoutImage, total: unique.length };
+  const withImage = fresh.filter((a) => a.image_url.startsWith('http'));
+  const withoutImage = fresh.filter((a) => !a.image_url.startsWith('http'));
+
+  return { withImage, withoutImage, total: fresh.length };
 }
 
 // ---------------------------------------------------------------
@@ -541,6 +640,7 @@ ${template}
 
 TITLE: [العنوان العربي المعاد كتابته]
 DESCRIPTION: [وصف تعريفي أقل من 150 حرفاً]
+SLUG: [3-5 كلمات إنجليزية تعبّر عن عنوان المقال، أحرف لاتينية صغيرة ومسافات فقط بدون رموز، مثل: egypt gold prices today]
 CONTENT:
 [فقرة افتتاحية من 3 إلى 4 أسطر]
 
@@ -599,11 +699,13 @@ async function aiRewrite(article, category) {
 
     const titleMatch = text.match(/TITLE:\s*(.+)/i);
     const descMatch = text.match(/DESCRIPTION:\s*(.+)/i);
+    const slugMatch = text.match(/SLUG:\s*(.+)/i);
     const contentMatch = text.match(/CONTENT:\s*([\s\S]+)/i);
 
     return {
       title: titleMatch ? titleMatch[1].trim() : article.title,
       description: descMatch ? descMatch[1].trim() : '',
+      slug: slugMatch ? slugMatch[1].trim() : '',
       content: contentMatch ? contentMatch[1].trim() : '',
     };
   } catch (err) {
@@ -681,16 +783,25 @@ function buildPost(article, category, rewritten) {
   }
 
   // Blogger builds the post URL from the Latin characters in the title only,
-  // so we append a short Latin keyword phrase to get an SEO-friendly URL like:
-  // https://blog.palugcr.live/2026/09/sports-news.html
+  // so we append a short Latin slug (AI-generated, derived from the post title)
+  // to get an SEO-friendly URL like:
+  // https://blog.palugcr.live/2026/09/egypt-gold-prices-today.html
   let finalTitle = rewritten.title.substring(0, 150);
-  if (CONFIG.urlKeywordsMode === 'category' && category.urlKeywords) {
-    finalTitle = `${finalTitle.replace(/[—–\-\s]+$/, '')} — ${category.urlKeywords}`;
+  if (CONFIG.urlKeywordsMode === 'category') {
+    const slug = (rewritten.slug || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, '')
+      .replace(/[\s-]+/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '')
+      .substring(0, 60);
+    const suffix = slug || category.urlKeywords;
+    finalTitle = `${finalTitle.replace(/[—–\-\s]+$/, '')} — ${suffix}`;
   }
 
-  // Labels ARE Blogger's tags: category + auto-extracted Arabic keywords + source
-  const autoTags = extractArabicKeywords(rewritten.title, rewritten.description);
-  const labels = [category.label, 'أخبار عربية', ...autoTags];
+  // Labels ARE Blogger's tags: fixed set only (category + supply + source),
+  // so the sidebar التصنيفات widget stays stable instead of growing forever.
+  const labels = [category.label, 'أخبار عربية'];
   const sourceTag = (article.creator || []).filter(Boolean)[0];
   if (sourceTag) labels.push(String(sourceTag).substring(0, 40).replace(/,/g, ' '));
 
@@ -749,10 +860,11 @@ async function publishCategory(categoryKey, count) {
     if (!post) continue;
 
     try {
-      const postId = await publishToBlogger(post);
-      console.log(`   ✅ Published to Blogger (post id ${postId})`);
+      const result = await publishToBlogger(post);
+      console.log(`   ✅ Published to Blogger (post id ${result.id})`);
       console.log(`      Title: ${post.title}`);
       console.log(`      Labels: ${post.labels.join(' | ')}`);
+      await submitToGoogleIndex(result.url);
       published++;
       await sleep(1200);
     } catch (err) {
@@ -763,6 +875,43 @@ async function publishCategory(categoryKey, count) {
 
   console.log(`   ➡️ ${published}/${count} published`);
   return published;
+}
+
+// ---------------------------------------------------------------
+// ROTATION SCHEDULER (SCHEDULE_MODE=rotation)
+// Each 15-min run publishes the NEXT category after the last post,
+// cycling through CATEGORY_ROTATION forever.
+// ---------------------------------------------------------------
+// Detect which category a post belongs to (via its Arabic category label,
+// falling back to the URL suffix in the title).
+function categoryKeyOfPost(post) {
+  if (!post) return null;
+  const labels = post.labels || [];
+  for (const key of Object.keys(CATEGORIES)) {
+    if (labels.includes(CATEGORIES[key].label)) return key;
+  }
+  if (post.title) {
+    for (const key of CATEGORY_ROTATION) {
+      if (post.title.includes(CATEGORIES[key].urlKeywords)) return key;
+    }
+  }
+  return null;
+}
+
+// Rotation scheduling: returns the next category key to publish.
+async function nextRotationCategory() {
+  try {
+    const data = await bloggerRequest('GET', '/posts?maxResults=1&orderBy=UPDATED&status=LIVE,DRAFT,SCHEDULED');
+    const currentKey = categoryKeyOfPost((data.items || [])[0]);
+    if (currentKey) {
+      const i = CATEGORY_ROTATION.indexOf(currentKey);
+      if (i >= 0) return CATEGORY_ROTATION[(i + 1) % CATEGORY_ROTATION.length]; // wraps to start
+      return CATEGORY_ROTATION[0];
+    }
+  } catch (err) {
+    console.log(`   ⚠️ Rotation state read failed (${err.message}) — starting round 1`);
+  }
+  return CATEGORY_ROTATION[0];
 }
 
 // ---------------------------------------------------------------
@@ -789,8 +938,15 @@ async function main() {
   }
 
   let total = 0;
-  for (const plan of CATEGORY_PLAN) {
-    total += await publishCategory(plan.key, plan.count);
+  if (CONFIG.scheduleMode === 'plan') {
+    for (const plan of CATEGORY_PLAN) {
+      total += await publishCategory(plan.key, plan.count);
+    }
+  } else {
+    const categoryKey = await nextRotationCategory();
+    const category = CATEGORIES[categoryKey];
+    console.log(`🔄 Rotation: publishing [${category.label}] (1 post this run)`);
+    total += await publishCategory(categoryKey, 1);
   }
 
   console.log(`\n✅ Done: ${total} posts published to blog.palugcr.live in ${((Date.now() - start) / 1000).toFixed(1)}s`);
@@ -968,4 +1124,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { main, runAuth, CATEGORIES, CATEGORY_PLAN, buildPost, publishToBlogger, getAccessToken };
+module.exports = { main, runAuth, CATEGORIES, CATEGORY_PLAN, CATEGORY_ROTATION, buildPost, publishToBlogger, getAccessToken };

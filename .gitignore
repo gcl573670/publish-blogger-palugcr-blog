@@ -1,3 +1,5 @@
 node_modules/
 run manually.txt
 .env
+*.iam.gserviceaccount.com.json
+index-api-blogger1-8c670b774bec.json
