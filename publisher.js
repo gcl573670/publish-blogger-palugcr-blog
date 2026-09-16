@@ -75,7 +75,7 @@ const AUTH_PORT = 3000;
 // ---------------------------------------------------------------
 // NEWS SOURCES CONFIG
 // ---------------------------------------------------------------
-const ARAB_COUNTRIES = 'eg,sa,ae,qa,kw,bh,om'; // Egypt + Gulf
+const ARAB_COUNTRIES = 'eg,sa,ae,qa,kw'; // NewsData caps at 5 countries per query (Egypt + top Gulf)
 
 // Free RSS feeds (no API key). Verified working Arabic feeds.
 const RSS_FEEDS = [
@@ -720,11 +720,27 @@ async function aiRewrite(article, category) {
       const slugMatch = text.match(/SLUG:\s*(.+)/i);
       const contentMatch = text.match(/CONTENT:\s*([\s\S]+)/i);
 
+      let content = contentMatch ? contentMatch[1].trim() : '';
+      // Salvage: if the model didn't emit a CONTENT: block, treat the rest of the
+      // response as the body (strip the header lines) so we still publish something.
+      if (content.length <= 10) {
+        const excerpt = text.trim().substring(0, 160).replace(/\s+/g, ' ');
+        console.log(`   ⚠️ No CONTENT: block found (saw: ${excerpt || '(empty)'}) — salvaging`);
+        content = text
+          .replace(/^TITLE:.*$/im, '')
+          .replace(/^DESCRIPTION:.*$/im, '')
+          .replace(/^SLUG:.*$/im, '')
+          .replace(/^CONTENT:\s*/im, '')
+          .replace(/[^\S\n]+/g, ' ')
+          .replace(/\n{3,}/g, '\n\n')
+          .trim();
+      }
+
       const parsed = {
         title: titleMatch ? titleMatch[1].trim() : article.title,
         description: descMatch ? descMatch[1].trim() : '',
         slug: slugMatch ? slugMatch[1].trim() : '',
-        content: contentMatch ? contentMatch[1].trim() : '',
+        content,
       };
 
       // Only accept if we got a real body; otherwise wait and retry once.
@@ -927,7 +943,9 @@ function categoryKeyOfPost(post) {
 async function nextRotationCategory() {
   try {
     const data = await bloggerRequest('GET', '/posts?maxResults=1&orderBy=UPDATED');
-    const currentKey = categoryKeyOfPost((data.items || [])[0]);
+    const last = (data.items || [])[0];
+    const currentKey = categoryKeyOfPost(last);
+    if (last) console.log(`   🔍 Last post: "${(last.title || '').substring(0, 50)}" → category: ${currentKey || '(none)'}`);
     if (currentKey) {
       const i = CATEGORY_ROTATION.indexOf(currentKey);
       if (i >= 0) return CATEGORY_ROTATION[(i + 1) % CATEGORY_ROTATION.length]; // wraps to start
