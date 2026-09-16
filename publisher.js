@@ -362,7 +362,7 @@ async function fetchNewsData(q, category) {
     apikey: CONFIG.newsDataKey,
     language: 'ar',
     country: ARAB_COUNTRIES,
-    size: String(MAX_FETCH),
+    size: String(Math.min(MAX_FETCH, 10)), // free plan caps results at 10
     image: '1',
     removeduplicate: '1',
   });
@@ -370,7 +370,10 @@ async function fetchNewsData(q, category) {
   if (category) params.set('category', category);
   const url = `https://newsdata.io/api/1/latest?${params.toString()}`;
   const res = await fetchWithTimeout(url);
-  if (!res.ok) throw new Error(`NewsData HTTP ${res.status}`);
+  if (!res.ok) {
+    const body = (await res.text()).substring(0, 300);
+    throw new Error(`NewsData HTTP ${res.status}: ${body}`);
+  }
   const data = await res.json();
   if (data.status !== 'success') throw new Error(data.message || 'NewsData API Error');
   return (data.results || []).map((a) => ({
@@ -484,7 +487,10 @@ async function fetchYouTube(categoryKey) {
   if (!channel) return [];
   const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=${channel.channelId}&order=date&type=video&maxResults=10&key=${CONFIG.youtubeKey}`;
   const res = await fetchWithTimeout(url);
-  if (!res.ok) throw new Error(`YouTube HTTP ${res.status}`);
+  if (!res.ok) {
+    const body = (await res.text()).substring(0, 300);
+    throw new Error(`YouTube HTTP ${res.status}: ${body}`);
+  }
   const data = await res.json();
   return (data.items || []).map((item) => ({
     title: cleanText(item.snippet.title),
@@ -671,47 +677,66 @@ async function aiRewrite(article, category) {
   const template = TEMPLATES[category.type] || TEMPLATES.news;
   const prompt = buildPrompt(article, category, template);
 
-  try {
-    const res = await fetchWithTimeout('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${CONFIG.openrouterKey}`,
-        'HTTP-Referer': 'https://blog.palugcr.live',
-        'X-Title': 'Arabic News Publisher',
-      },
-      body: JSON.stringify({
-        model: CONFIG.model,
-        messages: [{ role: 'user', content: prompt }],
-        max_tokens: 1800,
-        temperature: 0.6,
-      }),
-    });
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const temperature = attempt === 1 ? 0.6 : 0.8;
+      const res = await fetchWithTimeout('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${CONFIG.openrouterKey}`,
+          'HTTP-Referer': 'https://blog.palugcr.live',
+          'X-Title': 'Arabic News Publisher',
+        },
+        body: JSON.stringify({
+          model: CONFIG.model,
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: 1800,
+          temperature,
+        }),
+      });
 
-    if (!res.ok) {
-      const err = await res.text();
-      console.log(`   ⚠️ OpenRouter ${res.status}: ${err.substring(0, 200)}`);
-      return null;
+      if (!res.ok) {
+        const err = await res.text();
+        console.log(`   ⚠️ OpenRouter ${res.status}: ${err.substring(0, 200)}${attempt === 1 ? ' — retrying…' : ''}`);
+        if (attempt === 1) {
+          await sleep(2500);
+          continue;
+        }
+        return null;
+      }
+      const data = await res.json();
+      const text = data.choices?.[0]?.message?.content || '';
+      if (!text) {
+        if (attempt === 1) {
+          await sleep(2500);
+          continue;
+        }
+        return null;
+      }
+
+      const titleMatch = text.match(/TITLE:\s*(.+)/i);
+      const descMatch = text.match(/DESCRIPTION:\s*(.+)/i);
+      const slugMatch = text.match(/SLUG:\s*(.+)/i);
+      const contentMatch = text.match(/CONTENT:\s*([\s\S]+)/i);
+
+      const parsed = {
+        title: titleMatch ? titleMatch[1].trim() : article.title,
+        description: descMatch ? descMatch[1].trim() : '',
+        slug: slugMatch ? slugMatch[1].trim() : '',
+        content: contentMatch ? contentMatch[1].trim() : '',
+      };
+
+      // Only accept if we got a real body; otherwise wait and retry once.
+      if (parsed.content && parsed.content.length > 10) return parsed;
+      console.log(`   ⚠️ AI returned no readable content${attempt === 1 ? ' — retrying…' : ''}`);
+      if (attempt === 1) await sleep(2500);
+    } catch (err) {
+      console.log(`   ⚠️ OpenRouter failed: ${err.message}`);
+      if (attempt === 1) await sleep(2500);
     }
-    const data = await res.json();
-    const text = data.choices?.[0]?.message?.content || '';
-    if (!text) return null;
-
-    const titleMatch = text.match(/TITLE:\s*(.+)/i);
-    const descMatch = text.match(/DESCRIPTION:\s*(.+)/i);
-    const slugMatch = text.match(/SLUG:\s*(.+)/i);
-    const contentMatch = text.match(/CONTENT:\s*([\s\S]+)/i);
-
-    return {
-      title: titleMatch ? titleMatch[1].trim() : article.title,
-      description: descMatch ? descMatch[1].trim() : '',
-      slug: slugMatch ? slugMatch[1].trim() : '',
-      content: contentMatch ? contentMatch[1].trim() : '',
-    };
-  } catch (err) {
-    console.log(`   ⚠️ OpenRouter failed: ${err.message}`);
-    return null;
   }
+  return null;
 }
 
 // ---------------------------------------------------------------
@@ -901,7 +926,7 @@ function categoryKeyOfPost(post) {
 // Rotation scheduling: returns the next category key to publish.
 async function nextRotationCategory() {
   try {
-    const data = await bloggerRequest('GET', '/posts?maxResults=1&orderBy=UPDATED&status=LIVE,DRAFT,SCHEDULED');
+    const data = await bloggerRequest('GET', '/posts?maxResults=1&orderBy=UPDATED');
     const currentKey = categoryKeyOfPost((data.items || [])[0]);
     if (currentKey) {
       const i = CATEGORY_ROTATION.indexOf(currentKey);
