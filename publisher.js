@@ -903,23 +903,29 @@ async function resolveVideoEmbed(article) {
   if (!CONFIG.youtubeKey || !CONFIG.youtubeEmbedSearch) return '';
   try {
     const q = encodeURIComponent((article.title || '').substring(0, 100));
-    // relevance order (no order=date) always returns meaningful results; we still prefer newer ones.
-    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoEmbeddable=true&relevanceLanguage=ar&maxResults=3&q=${q}&key=${CONFIG.youtubeKey}`;
-    const res = await fetchWithTimeout(url);
-    const bodyText = await res.text();
-    if (!res.ok) {
-      console.log(`   ⚠️ YouTube embed search HTTP ${res.status}: ${bodyText.slice(0, 200)}`);
-      return '';
+    for (const lang of ['ar', '']) {
+      // relevance order (no order=date) always returns meaningful results; we still prefer newer ones.
+      const rel = lang ? `&relevanceLanguage=${lang}` : '';
+      const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoEmbeddable=true&maxResults=3${rel}&q=${q}&key=${CONFIG.youtubeKey}`;
+      const res = await fetchWithTimeout(url);
+      const bodyText = await res.text();
+      if (!res.ok) {
+        console.log(`   ⚠️ YouTube embed search HTTP ${res.status}: ${bodyText.slice(0, 200)}`);
+        return '';
+      }
+      const data = JSON.parse(bodyText);
+      const items = data.items || [];
+      console.log(`   🎬 Embed search for "${(article.title || '').substring(0, 40)}" → ${items.length} result(s)`);
+      if (items.length) {
+        // Prefer the newest result; fall back to the first.
+        const sorted = items
+          .map((it) => ({ vid: it.id?.videoId, title: it.snippet?.title || '', date: it.snippet?.publishedAt || '' }))
+          .sort((a, b) => (b.date < a.date ? -1 : b.date > a.date ? 1 : 0));
+        const hit = sorted[0];
+        if (hit && hit.vid) return youTubeEmbed(hit.vid, hit.title || '');
+      }
+      if (lang) console.log(`   🎬 0 results with Arabic filter, retrying without it`);
     }
-    const data = JSON.parse(bodyText);
-    const items = data.items || [];
-    console.log(`   🎬 Embed search for "${(article.title || '').substring(0, 40)}" → ${items.length} result(s)`);
-    // Prefer the newest result; fall back to the first.
-    const sorted = items
-      .map((it) => ({ vid: it.id?.videoId, title: it.snippet?.title || '', date: it.snippet?.publishedAt || '' }))
-      .sort((a, b) => (b.date < a.date ? -1 : b.date > a.date ? 1 : 0));
-    const hit = sorted[0];
-    if (hit && hit.vid) return youTubeEmbed(hit.vid, hit.title || '');
     console.log(`   ⚠️ YouTube embed search returned no items`);
   } catch (err) {
     console.log(`   ⚠️ YouTube embed search error: ${err.message}`);
