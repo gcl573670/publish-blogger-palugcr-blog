@@ -256,11 +256,18 @@ async function bloggerRequest(method, urlPath, bodyObj) {
 
 async function listExistingPosts(maxResults = 100) {
   try {
-    const data = await bloggerRequest('GET', `/posts?maxResults=${maxResults}&status=LIVE`);
-    return (data.items || []).map((p) => normalizeText(p.title));
+    const data = await bloggerRequest('GET', `/posts?maxResults=${maxResults}&orderBy=UPDATED`);
+    const titles = [];
+    const images = [];
+    for (const p of data.items || []) {
+      titles.push(normalizeText(p.title));
+      const img = /<img[^>]+src=["']([^"']+)["']/i.exec(p.content || '');
+      if (img) images.push(img[1]);
+    }
+    return { titles, images };
   } catch (err) {
     console.log(`   ⚠️ Could not list posts (${err.message}) — skipping dedupe`);
-    return [];
+    return { titles: [], images: [] };
   }
 }
 
@@ -519,7 +526,7 @@ async function imageQualifies(url) {
     if (!res.ok) return true;
     const dims = imageDimensions(Buffer.from(await res.arrayBuffer()));
     if (!dims) return true;
-    return dims.width >= 320 && dims.height >= 180;
+    return dims.width >= 640 && dims.height >= 360;
   } catch {
     return true;
   }
@@ -889,19 +896,31 @@ function youTubeEmbed(videoId, title = '') {
 //   1) the article IS a YouTube video  -> embed that exact video (free)
 //   2) otherwise search YouTube for a recent related video  -> embed it
 async function resolveVideoEmbed(article) {
-  if (article.video_id) return youTubeEmbed(article.video_id, article.title || '');
+  if (article.video_id) {
+    console.log(`   🎬 Using source video ${article.video_id}`);
+    return youTubeEmbed(article.video_id, article.title || '');
+  }
   if (!CONFIG.youtubeKey || !CONFIG.youtubeEmbedSearch) return '';
   try {
     const q = encodeURIComponent((article.title || '').substring(0, 100));
-    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoEmbeddable=true&order=date&maxResults=1&relevanceLanguage=ar&q=${q}&key=${CONFIG.youtubeKey}`;
+    // relevance order (no order=date) always returns meaningful results; we still prefer newer ones.
+    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoEmbeddable=true&relevanceLanguage=ar&maxResults=3&q=${q}&key=${CONFIG.youtubeKey}`;
     const res = await fetchWithTimeout(url);
+    const bodyText = await res.text();
     if (!res.ok) {
-      console.log(`   ⚠️ YouTube embed search HTTP ${res.status}`);
+      console.log(`   ⚠️ YouTube embed search HTTP ${res.status}: ${bodyText.slice(0, 200)}`);
       return '';
     }
-    const data = await res.json();
-    const vid = data.items?.[0]?.id?.videoId;
-    if (vid) return youTubeEmbed(vid, (data.items[0].snippet && data.items[0].snippet.title) || '');
+    const data = JSON.parse(bodyText);
+    const items = data.items || [];
+    console.log(`   🎬 Embed search for "${(article.title || '').substring(0, 40)}" → ${items.length} result(s)`);
+    // Prefer the newest result; fall back to the first.
+    const sorted = items
+      .map((it) => ({ vid: it.id?.videoId, title: it.snippet?.title || '', date: it.snippet?.publishedAt || '' }))
+      .sort((a, b) => (b.date < a.date ? -1 : b.date > a.date ? 1 : 0));
+    const hit = sorted[0];
+    if (hit && hit.vid) return youTubeEmbed(hit.vid, hit.title || '');
+    console.log(`   ⚠️ YouTube embed search returned no items`);
   } catch (err) {
     console.log(`   ⚠️ YouTube embed search error: ${err.message}`);
   }
@@ -965,9 +984,10 @@ async function publishCategory(categoryKey, count) {
   console.log(`   📰 ${candidates.total} unique candidates (${candidates.withImage.length} with image)`);
 
   const existing = await listExistingPosts();
-  const seen = new Set(existing);
+  const seen = new Set(existing.titles);
+  const usedImages = new Set(existing.images);
 
-  // Prefer candidates with images first
+  // Prefer candidates with images first; skip titles AND images already used.
   let pool = [];
   for (const batch of [candidates.withImage, candidates.withoutImage]) {
     for (const a of batch) {
@@ -975,6 +995,8 @@ async function publishCategory(categoryKey, count) {
       const key = normalizeText(a.title);
       if (seen.has(key)) continue;
       seen.add(key);
+      if (a.image_url.startsWith('http') && usedImages.has(a.image_url)) continue; // image already published
+      usedImages.add(a.image_url);
       pool.push(a);
     }
     if (pool.length >= count) break;

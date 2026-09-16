@@ -552,14 +552,14 @@
               <b:if cond='data:post.featuredImage'>
                 <div class='post-thumb'>
                   <a expr:href='data:post.url'>
-                    <img expr:alt='data:post.title' expr:src='resizeImage(data:post.featuredImage, 800)' loading='lazy'/>
+                    <img expr:alt='data:post.title' expr:src='resizeImage(data:post.featuredImage, 1200)' loading='lazy'/>
                   </a>
                 </div>
               <b:else/>
                 <b:if cond='data:post.firstImageUrl'>
                   <div class='post-thumb'>
                     <a expr:href='data:post.url'>
-                      <img expr:alt='data:post.title' expr:src='resizeImage(data:post.firstImageUrl, 800)' loading='lazy'/>
+                      <img expr:alt='data:post.title' expr:src='resizeImage(data:post.firstImageUrl, 1200)' loading='lazy'/>
                     </a>
                   </div>
                 </b:if>
