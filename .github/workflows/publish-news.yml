@@ -40,3 +40,4 @@ jobs:
           GNEWS_TIMEFRAME: ${{ secrets.GNEWS_TIMEFRAME }}
           SCHEDULE_MODE: ${{ secrets.SCHEDULE_MODE }}
           GOOGLE_INDEXING_KEY_JSON: ${{ secrets.GOOGLE_INDEXING_KEY_JSON }}
+          YOUTUBE_EMBED_SEARCH: ${{ secrets.YOUTUBE_EMBED_SEARCH }}

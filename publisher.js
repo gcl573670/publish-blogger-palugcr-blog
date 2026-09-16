@@ -65,6 +65,9 @@ const CONFIG = {
   scheduleMode: (process.env.SCHEDULE_MODE || 'rotation'),
   // Google Indexing API service account JSON (base64-encoded). Leave empty to disable.
   indexingKeyJson: process.env.GOOGLE_INDEXING_KEY_JSON || '',
+  // Embed a related YouTube video at the bottom of every article ('1' = on).
+  // Note: each per-post search costs ~100 YouTube API units (10,000/day free quota).
+  youtubeEmbedSearch: (process.env.YOUTUBE_EMBED_SEARCH || '1').toUpperCase() !== '0',
 };
 
 const FETCH_TIMEOUT = 30000;
@@ -97,8 +100,8 @@ const YOUTUBE_CHANNELS = {
 // CATEGORY_PLAN below decides which ones run each day and how many posts each.
 const CATEGORIES = {
   trending: {
-    label: 'ترند اليوم',
-    urlKeywords: 'trending-news',
+    label: 'اليوم',
+    urlKeywords: 'today-news',
     type: 'trending',
     gnewsQuery: 'ترند',
     newsDataCategory: 'top',
@@ -185,7 +188,7 @@ const CATEGORY_ROTATION = [
   'market',
 ];
 
-const MAX_FETCH = 12; // fetch up to 12 candidates per category before AI rewrite
+const MAX_FETCH = 20; // fetch up to 20 candidates per category before AI rewrite
 
 // ---------------------------------------------------------------
 // Fetch with timeout
@@ -469,6 +472,59 @@ function isFresh(pubDate, maxHours) {
   return Date.now() - ms <= maxHours * 3600 * 1000;
 }
 
+// ---------------------------------------------------------------
+// IMAGE QUALITY GATE — reject blurry/tiny feature images.
+// Reads the image header and parses its real dimensions.
+// ---------------------------------------------------------------
+function imageDimensions(buf) {
+  if (!buf || buf.length < 12) return null;
+  if (buf[0] === 0xff && buf[1] === 0xd8) {
+    // JPEG: scan for a SOF marker (C0..CF except C4/C8/CC)
+    let i = 2;
+    while (i < buf.length - 8) {
+      if (buf[i] !== 0xff) { i++; continue; }
+      const marker = buf[i + 1];
+      if (marker === 0xda || marker === 0xd9) break; // SOS / EOI
+      if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+        return { width: buf.readUInt16BE(i + 7), height: buf.readUInt16BE(i + 5) };
+      }
+      const len = buf.readUInt16BE(i + 2);
+      i += 2 + len;
+    }
+    return null;
+  }
+  const magic = buf.toString('ascii', 0, 8);
+  if (magic === '\x89PNG\r\n\x1a\n') {
+    return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+  }
+  if (buf.toString('ascii', 0, 6) === 'GIF89a' || buf.toString('ascii', 0, 6) === 'GIF87a') {
+    return { width: buf.readUInt16LE(6), height: buf.readUInt16LE(8) };
+  }
+  if (buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') {
+    const fourcc = buf.toString('ascii', 12, 16);
+    if (fourcc === 'VP8 ') return { width: buf.readUInt16LE(19) & 0x3fff, height: buf.readUInt16LE(21) & 0x3fff };
+    if (fourcc === 'VP8L') {
+      const b4 = buf.readUInt32LE(20);
+      return { width: (b4 & 0x3fff) + 1, height: ((b4 >> 14) & 0x3fff) + 1 };
+    }
+    if (fourcc === 'VP8X') return { width: (buf.readUInt32LE(24) & 0xffffff) + 1, height: (buf.readUInt32LE(27) & 0xffffff) + 1 };
+  }
+  return null;
+}
+
+// Returns true if image is usable (>=320px wide). Unverifiable images are accepted.
+async function imageQualifies(url) {
+  try {
+    const res = await fetchWithTimeout(url, { headers: { Range: 'bytes=0-32767' } });
+    if (!res.ok) return true;
+    const dims = imageDimensions(Buffer.from(await res.arrayBuffer()));
+    if (!dims) return true;
+    return dims.width >= 320 && dims.height >= 180;
+  } catch {
+    return true;
+  }
+}
+
 function decodeXml(s) {
   return (s || '')
     .replace(/<!\[CDATA\[|\]\]>/g, '')
@@ -497,10 +553,14 @@ async function fetchYouTube(categoryKey) {
     description: cleanText(item.snippet.description),
     content: cleanText(item.snippet.description),
     link: `https://www.youtube.com/watch?v=${item.id.videoId}`,
-    image_url: item.snippet.thumbnails?.high?.url || item.snippet.thumbnails?.medium?.url || '',
+    image_url: item.snippet.thumbnails?.maxres?.url
+      || item.snippet.thumbnails?.high?.url
+      || item.snippet.thumbnails?.medium?.url
+      || '',
     source_name: channel.name,
     pubDate: item.snippet.publishedAt,
     article_id: item.id.videoId,
+    video_id: item.id.videoId,
     creator: [item.snippet.channelTitle || channel.name],
   }));
 }
@@ -544,8 +604,16 @@ async function collectArticles(categoryKey) {
   const fresh = unique.filter((a) => isFresh(a.pubDate, CONFIG.maxNewsAgeHours))
     .sort((a, b) => (parseArticleDate(b.pubDate) || 0) - (parseArticleDate(a.pubDate) || 0));
 
-  const withImage = fresh.filter((a) => a.image_url.startsWith('http'));
-  const withoutImage = fresh.filter((a) => !a.image_url.startsWith('http'));
+  const withImage = [];
+  const withoutImage = [];
+  for (const a of fresh) {
+    if (a.image_url.startsWith('http')) {
+      if (await imageQualifies(a.image_url)) withImage.push(a);
+      else withoutImage.push(a); // poor/blurry image -> publish without a hero
+    } else {
+      withoutImage.push(a);
+    }
+  }
 
   return { withImage, withoutImage, total: fresh.length };
 }
@@ -558,8 +626,8 @@ const TEMPLATES = {
 المطلوب: مقال متكامل يجيب بسرعة وبعمق على سبب البحث، ويكون أول من يشرح القصة بوضوح.
 هيكل المحتوى المطلوب:
 - فقرة افتتاحية تمهيدية (3-4 أسطر): عن ماذا يتحدث الخبر ومن المعني به.
-- القسم الرئيسي "## ما القصة؟" أو "## لماذا يتصدر هذا الموضوع التريند؟": اشرح التفاصيل في 2-3 فقرات.
-- نقاط سريعة بشرطة (-): ماذا حدث؟ | متى وأين؟ | أبرز التصريحات والمصادر | لماذا أصبح تريند؟ | آخر المستجدات.
+- القسم الرئيسي "## ما القصة؟": اشرح التفاصيل في 2-3 فقرات.
+- نقاط سريعة بشرطة (-): ماذا حدث؟ | متى وأين؟ | أبرز التصريحات والمصادر | آخر المستجدات.
 - خاتمة (2-3 أسطر): ماذا نتوقع خلال الساعات القادمة، وسؤال للقارئ لإبقائه.
 نصيحة SEO: كلمة التريند في العنوان والمقدمة وأول عنوان فرعي، واجعل الفقرات مشوقة لا تقريرية جافة.`,
 
@@ -795,7 +863,7 @@ function rawToHtml(content) {
   return html;
 }
 
-function buildContent(article, rewritten, category, sourceName) {
+function buildContent(article, rewritten, category, sourceName, videoEmbed = '') {
   const body = rawToHtml(rewritten.content);
   const img = article.image_url.startsWith('http')
     ? `<img src="${htmlEscape(article.image_url)}" alt="${htmlEscape(rewritten.title)}" style="width:100%;height:auto;border-radius:10px;margin-bottom:18px;"/>`
@@ -804,13 +872,46 @@ function buildContent(article, rewritten, category, sourceName) {
     ? `<p style="margin-top:18px;font-size:12px;color:#888;">المصدر: <a href="${htmlEscape(article.link)}" target="_blank" rel="noopener nofollow">${htmlEscape(sourceName)}</a></p>`
     : '';
   const published = new Date().toLocaleString('ar-EG', { dateStyle: 'long', timeStyle: 'short' });
-  return `<div dir="rtl" lang="ar">${img}<h2 style="font-size:0;">:: ${htmlEscape(category.label)} ::</h2>${body}${source}<p style="font-size:12px;color:#888;">نُشر في ${published}</p></div>`;
+  return `<div dir="rtl" lang="ar">${img}<h2 style="font-size:0;">:: ${htmlEscape(category.label)} ::</h2>${body}${videoEmbed}${source}<p style="font-size:12px;color:#888;">نُشر في ${published}</p></div>`;
+}
+
+// ---------------------------------------------------------------
+// YOUTUBE VIDEO EMBED (bottom of the article)
+// ---------------------------------------------------------------
+function youTubeEmbed(videoId, title = '') {
+  return `<div dir="rtl" lang="ar" style="margin-top:20px;text-align:center;">
+  <h3 style="font-size:18px;margin:14px 0 10px;">📺 شاهد الفيديو</h3>
+  <iframe width="100%" height="380" src="https://www.youtube.com/embed/${htmlEscape(videoId)}" title="${htmlEscape(title)}" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen="" style="max-width:720px;aspect-ratio:16/9;border-radius:10px;"></iframe>
+</div>`;
+}
+
+// Resolve the video to embed for an article:
+//   1) the article IS a YouTube video  -> embed that exact video (free)
+//   2) otherwise search YouTube for a recent related video  -> embed it
+async function resolveVideoEmbed(article) {
+  if (article.video_id) return youTubeEmbed(article.video_id, article.title || '');
+  if (!CONFIG.youtubeKey || !CONFIG.youtubeEmbedSearch) return '';
+  try {
+    const q = encodeURIComponent((article.title || '').substring(0, 100));
+    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoEmbeddable=true&order=date&maxResults=1&relevanceLanguage=ar&q=${q}&key=${CONFIG.youtubeKey}`;
+    const res = await fetchWithTimeout(url);
+    if (!res.ok) {
+      console.log(`   ⚠️ YouTube embed search HTTP ${res.status}`);
+      return '';
+    }
+    const data = await res.json();
+    const vid = data.items?.[0]?.id?.videoId;
+    if (vid) return youTubeEmbed(vid, (data.items[0].snippet && data.items[0].snippet.title) || '');
+  } catch (err) {
+    console.log(`   ⚠️ YouTube embed search error: ${err.message}`);
+  }
+  return '';
 }
 
 // ---------------------------------------------------------------
 // VALIDATION + POST BUILD
 // ---------------------------------------------------------------
-function buildPost(article, category, rewritten) {
+function buildPost(article, category, rewritten, videoEmbed = '') {
   const sourceName = article.source_name || category.label;
 
   const stripped = rewritten.content.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
@@ -840,15 +941,13 @@ function buildPost(article, category, rewritten) {
     finalTitle = `${finalTitle.replace(/[—–\-\s]+$/, '')} — ${suffix}`;
   }
 
-  // Labels ARE Blogger's tags: fixed set only (category + supply + source),
-  // so the sidebar التصنيفات widget stays stable instead of growing forever.
-  const labels = [category.label, 'أخبار عربية'];
-  const sourceTag = (article.creator || []).filter(Boolean)[0];
-  if (sourceTag) labels.push(String(sourceTag).substring(0, 40).replace(/,/g, ' '));
+  // Only ONE label per post: the category from the fixed list.
+  // (Rotation detection reads this label to cycle categories.)
+  const labels = [category.label];
 
   const post = {
     title: finalTitle,
-    content: buildContent(article, rewritten, category, sourceName),
+    content: buildContent(article, rewritten, category, sourceName, videoEmbed),
     labels: Array.from(new Set(labels)).slice(0, 8),
     published: new Date().toISOString(),
   };
@@ -897,7 +996,8 @@ async function publishCategory(categoryKey, count) {
       rewritten.description = rewritten.title;
     }
 
-    const post = buildPost(article, category, rewritten);
+    const videoEmbed = await resolveVideoEmbed(article);
+    const post = buildPost(article, category, rewritten, videoEmbed);
     if (!post) continue;
 
     try {
