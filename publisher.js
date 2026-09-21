@@ -1106,10 +1106,18 @@ async function main() {
       total += await publishCategory(plan.key, plan.count);
     }
   } else {
-    const categoryKey = await nextRotationCategory();
-    const category = CATEGORIES[categoryKey];
-    console.log(`🔄 Rotation: publishing [${category.label}] (1 post this run)`);
-    total += await publishCategory(categoryKey, 1);
+    // Rotation: try categories until one publishes (avoids silent 0-post runs)
+    const startKey = await nextRotationCategory();
+    const startIdx = CATEGORY_ROTATION.indexOf(startKey);
+    for (let i = 0; i < CATEGORY_ROTATION.length; i++) {
+      const categoryKey = CATEGORY_ROTATION[(startIdx + i) % CATEGORY_ROTATION.length];
+      const category = CATEGORIES[categoryKey];
+      console.log(`🔄 Rotation: trying [${category.label}]`);
+      const published = await publishCategory(categoryKey, 1);
+      total += published;
+      if (published > 0) break;
+      console.log(`   ⏭️  No publishable article in ${category.label}, next...`);
+    }
   }
 
   console.log(`\n✅ Done: ${total} posts published to blog.palugcr.live in ${((Date.now() - start) / 1000).toFixed(1)}s`);
