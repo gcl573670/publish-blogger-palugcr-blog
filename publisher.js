@@ -521,18 +521,18 @@ function imageDimensions(buf) {
   return null;
 }
 
-// Returns true if image is usable (>=640px wide). Unverifiable images are accepted.
+// Returns true if image is usable (>=320px wide). Unverifiable images are accepted.
 async function imageQualifies(url) {
   try {
     const res = await fetchWithTimeout(url, { headers: { Range: 'bytes=0-32767' } });
     // Non-2xx = the image is genuinely broken -> never publish it.
     if (!res.ok) return false;
     const dims = imageDimensions(Buffer.from(await res.arrayBuffer()));
-    if (dims) return dims.width >= 640 && dims.height >= 360;
+    if (dims) return dims.width >= 320 && dims.height >= 180;
     // Couldn't parse the header — but if the URL itself advertises a small
     // width, treat it as too small (e.g. BBC /ws/240/, or w=360 queries).
     const m = (url || '').match(/\/(?:ws\/)?(\d{3})\b|[-_](\d{3})x\b|[?&]w=(\d{3})\b/);
-    if (m && Number(m[1] || m[2] || m[3]) < 640) return false;
+    if (m && Number(m[1] || m[2] || m[3]) < 320) return false;
     return true;
   } catch {
     return true;
