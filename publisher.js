@@ -343,34 +343,8 @@ async function submitToGoogleIndex(postUrl) {
 }
 
 // ---------------------------------------------------------------
-// STRIP ENGLISH SLUG FROM POST TITLE
-// Blogger generates the URL at creation time from the Latin chars in
-// the title. By updating the title AFTER publishing, we get a clean
-// Arabic-only title while keeping the SEO-friendly URL intact.
+// NEWS SOURCE FETCHERS (Arabic only)
 // ---------------------------------------------------------------
-async function stripSlugFromTitle(postId, arabicTitle) {
-  try {
-    const token = await getAccessToken();
-    const base = `https://www.googleapis.com/blogger/v3/blogs/${CONFIG.blogId}`;
-    // Fetch full post
-    const getRes = await fetchWithTimeout(`${base}/posts/${postId}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (!getRes.ok) throw new Error(`GET post ${getRes.status}`);
-    const post = await getRes.json();
-    // Update title to Arabic only
-    post.title = arabicTitle;
-    const putRes = await fetchWithTimeout(`${base}/posts/${postId}`, {
-      method: 'PUT',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(post),
-    });
-    if (!putRes.ok) throw new Error(`PUT post ${putRes.status}`);
-    console.log(`   ✏️  Title cleaned (slug removed)`);
-  } catch (err) {
-    console.log(`   ⚠️  Title cleanup failed: ${err.message} (slug still in title)`);
-  }
-}
 
 async function fetchGNews(query) {
   if (!CONFIG.gnewsKey) return [];
@@ -1067,11 +1041,6 @@ async function publishCategory(categoryKey, count) {
       console.log(`      Title: ${post.title}`);
       console.log(`      Labels: ${post.labels.join(' | ')}`);
       await submitToGoogleIndex(result.url);
-      // Strip English slug from displayed title (URL stays intact)
-      const arabicTitle = rewritten.title.substring(0, 150);
-      if (arabicTitle && arabicTitle !== post.title) {
-        await stripSlugFromTitle(result.id, arabicTitle);
-      }
       published++;
       await sleep(1200);
     } catch (err) {
