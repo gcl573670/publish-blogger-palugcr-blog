@@ -956,22 +956,7 @@ function buildPost(article, category, rewritten, videoEmbed = '') {
     return null;
   }
 
-  // Blogger builds the post URL from the Latin characters in the title only,
-  // so we append a short Latin slug (AI-generated, derived from the post title)
-  // to get an SEO-friendly URL like:
-  // https://blog.palugcr.live/2026/09/egypt-gold-prices-today.html
   let finalTitle = rewritten.title.substring(0, 150);
-  if (CONFIG.urlKeywordsMode === 'category') {
-    const slug = (rewritten.slug || '')
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, '')
-      .replace(/[\s-]+/g, '-')
-      .replace(/-+/g, '-')
-      .replace(/^-|-$/g, '')
-      .substring(0, 60);
-    const suffix = slug || category.urlKeywords;
-    finalTitle = `${finalTitle.replace(/[—–\-\s]+$/, '')} — ${suffix}`;
-  }
 
   // Only ONE label per post: the category from the fixed list.
   // (Rotation detection reads this label to cycle categories.)
